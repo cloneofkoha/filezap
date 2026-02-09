@@ -239,46 +239,62 @@ def fill_docx(input_path: str, output_path: str, mappings: list):
     doc = docx.Document(input_path)
 
     # Build a lookup: lowercase label → value
+    # Also build alternate keys for fuzzy matching
     label_map = {}
     for m in mappings:
         label = m.get("form_label", "").strip().lower().rstrip(":")
         value = m.get("value")
         if label and value and value != "null":
             label_map[label] = value
+            # Also add without common suffixes/prefixes
+            clean = re.sub(r'\s*\(.*?\)\s*', '', label).strip()
+            if clean and clean != label:
+                label_map[clean] = value
+
+    print(f"   📝 Label map has {len(label_map)} entries")
 
     filled = 0
 
     # Strategy 1: Fill table cells (most common Word form layout)
-    for table in doc.tables:
-        for row in table.rows:
+    for t_idx, table in enumerate(doc.tables):
+        for r_idx, row in enumerate(table.rows):
             cells = row.cells
             # Build list of unique cells (skip merged duplicates)
             unique_cells = []
-            seen_tcs = set()
+            seen_tcs = []
             for cell in cells:
-                tc_id = id(cell._tc)
-                if tc_id not in seen_tcs:
-                    seen_tcs.add(tc_id)
+                tc = cell._tc
+                if tc not in seen_tcs:
+                    seen_tcs.append(tc)
                     unique_cells.append(cell)
 
             for i, cell in enumerate(unique_cells):
                 cell_text = cell.text.strip().lower().rstrip(":")
+                if not cell_text:
+                    continue
+
                 # Also try matching without parenthetical notes
-                cell_text_clean = re.sub(r'\s*\(.*?\)\s*', '', cell_text).strip()
+                cell_text_clean = re.sub(r'\s*\(.*?\)\s*', '', cell_text).strip().rstrip(":")
 
                 matched_value = None
+                # Direct match
                 if cell_text in label_map:
                     matched_value = label_map[cell_text]
                 elif cell_text_clean and cell_text_clean in label_map:
                     matched_value = label_map[cell_text_clean]
+                else:
+                    # Fuzzy: check if any label is contained in cell text or vice versa
+                    for lbl, val in label_map.items():
+                        if lbl in cell_text or cell_text in lbl:
+                            matched_value = val
+                            break
 
                 if matched_value and i + 1 < len(unique_cells):
                     answer_cell = unique_cells[i + 1]
-                    # Skip if answer cell is not empty (already has content)
-                    if answer_cell.text.strip() and answer_cell.text.strip() != cell.text.strip():
-                        # Cell already has real content, check if it looks like a label
-                        if ':' in answer_cell.text:
-                            continue
+                    # Skip if answer cell already has meaningful content that looks like a label
+                    existing = answer_cell.text.strip()
+                    if existing and ':' in existing:
+                        continue
 
                     # Clear the answer cell
                     for paragraph in answer_cell.paragraphs:
@@ -294,24 +310,22 @@ def fill_docx(input_path: str, output_path: str, mappings: list):
                         run.font.size = Pt(9)
 
                     filled += 1
+                    print(f"   ✅ T{t_idx}R{r_idx}: '{cell_text[:30]}' → '{matched_value[:30]}'")
 
     # Strategy 2: Fill inline "Label: ____" patterns in paragraphs
     for paragraph in doc.paragraphs:
         for label, value in label_map.items():
-            # Match patterns like "Company Name: ________" or "Company Name:"
             pattern = re.compile(
                 re.escape(label) + r'\s*:\s*[_\s]*$',
                 re.IGNORECASE
             )
             if pattern.search(paragraph.text):
-                # Replace the blank area with the value
                 new_text = re.sub(
                     r'(:\s*)[_\s]*$',
                     f'\\1{value}',
                     paragraph.text,
                     flags=re.IGNORECASE
                 )
-                # Preserve formatting from first run
                 if paragraph.runs:
                     for run in paragraph.runs:
                         run.text = ""
@@ -321,6 +335,7 @@ def fill_docx(input_path: str, output_path: str, mappings: list):
                 filled += 1
 
     doc.save(output_path)
+    print(f"   📝 Docx saved with {filled} fills")
     return filled
 
 
@@ -370,34 +385,146 @@ def _fill_pdf_fields(input_path, output_path, mappings, reader):
 
 def _fill_pdf_overlay(input_path, output_path, mappings):
     """
-    For non-fillable PDFs: create a text overlay.
-    This creates a companion text file with the mappings for manual entry,
-    since precise coordinate-based filling requires visual analysis.
+    For non-fillable PDFs: detect table cell boundaries with pdfplumber,
+    then overlay text into the correct cells using reportlab.
     """
-    # Save a reference guide alongside the PDF
-    guide_path = output_path.replace(".pdf", "_fill_guide.txt")
-    lines = ["VENDOR FORM FILL GUIDE", "=" * 50, ""]
-    filled = 0
+    import pdfplumber
+    from reportlab.pdfgen import canvas as rl_canvas
+    from pypdf import PdfReader, PdfWriter
+    import io
+
+    # Build label → value map
+    label_map = {}
     for m in mappings:
-        label = m.get("form_label", "Unknown")
-        value = m.get("value", "")
-        conf = m.get("confidence", "")
-        if value and value != "null":
-            lines.append(f"  {label}: {value}  [{conf}]")
-            filled += 1
-        else:
-            lines.append(f"  {label}: [NOT FOUND IN MASTER DATA]")
-    lines.append("")
-    lines.append("Copy these values into the PDF form manually or use a PDF editor.")
+        label = m.get("form_label", "").strip().lower().rstrip(":")
+        value = m.get("value")
+        if label and value and value != "null":
+            label_map[label] = value
+            clean = re.sub(r'\s*\(.*?\)\s*', '', label).strip().rstrip(":")
+            if clean and clean != label:
+                label_map[clean] = value
 
-    with open(guide_path, "w") as f:
-        f.write("\n".join(lines))
+    # Find field positions using table cell boundaries
+    field_positions = []
 
-    # Copy original PDF as-is
-    import shutil
-    shutil.copy2(input_path, output_path)
+    with pdfplumber.open(input_path) as pdf:
+        for page_idx, page in enumerate(pdf.pages):
+            page_height = page.height
+            page_width = page.width
+            tables = page.find_tables()
+            words = page.extract_words(keep_blank_chars=False, extra_attrs=["size"])
 
-    print(f"   ℹ️  PDF has no fillable fields. Fill guide saved: {guide_path}")
+            for table in tables:
+                for row in table.rows:
+                    cells = row.cells
+                    if not cells:
+                        continue
+
+                    # Get text content for each cell
+                    cell_texts = []
+                    for cell_bbox in cells:
+                        if cell_bbox is None:
+                            cell_texts.append(("", None))
+                            continue
+                        cx0, ctop, cx1, cbottom = cell_bbox
+                        cell_words = [w for w in words
+                                      if w["x0"] >= cx0 - 2 and w["x1"] <= cx1 + 2
+                                      and w["top"] >= ctop - 2 and w["bottom"] <= cbottom + 2]
+                        text = " ".join(w["text"] for w in sorted(cell_words, key=lambda w: (w["top"], w["x0"])))
+                        cell_texts.append((text.strip(), cell_bbox))
+
+                    # Match labels to next empty cell
+                    for i, (text, bbox_i) in enumerate(cell_texts):
+                        if not text or not bbox_i:
+                            continue
+                        text_lower = text.lower().rstrip(":").strip()
+                        text_clean = re.sub(r'\s*\(.*?\)\s*', '', text_lower).strip()
+
+                        for label, value in label_map.items():
+                            matched = False
+                            if text_lower == label or text_clean == label:
+                                matched = True
+                            elif label in text_lower and len(label) > 3:
+                                matched = True
+
+                            if matched:
+                                for j in range(i + 1, len(cell_texts)):
+                                    next_text, next_bbox = cell_texts[j]
+                                    if next_bbox is None:
+                                        continue
+                                    if len(next_text) < 3 or next_text == text:
+                                        cx0, ctop, cx1, cbottom = next_bbox
+                                        fill_x = cx0 + 4
+                                        fill_y = ctop + 3
+
+                                        # Check for duplicate positions
+                                        dupe = any(abs(fp["y"] - fill_y) < 5 and abs(fp["x"] - fill_x) < 5
+                                                   for fp in field_positions)
+                                        if not dupe:
+                                            field_positions.append({
+                                                "page": page_idx,
+                                                "x": fill_x,
+                                                "y": fill_y,
+                                                "value": value,
+                                                "font_size": 8,
+                                                "page_height": page_height,
+                                                "page_width": page_width,
+                                            })
+                                        break
+                                break
+
+    if not field_positions:
+        # Fallback to guide
+        print("   ⚠️  Could not detect field positions, generating fill guide")
+        guide_path = output_path.replace(".pdf", "_fill_guide.txt")
+        lines_out = ["VENDOR FORM FILL GUIDE", "=" * 50, ""]
+        filled = 0
+        for m in mappings:
+            lbl = m.get("form_label", "Unknown")
+            val = m.get("value", "")
+            if val and val != "null":
+                lines_out.append(f"  {lbl}: {val}")
+                filled += 1
+            else:
+                lines_out.append(f"  {lbl}: [NOT FOUND]")
+        with open(guide_path, "w") as f:
+            f.write("\n".join(lines_out))
+        import shutil
+        shutil.copy2(input_path, output_path)
+        return filled
+
+    # Create overlay and merge
+    reader = PdfReader(input_path)
+    writer = PdfWriter()
+
+    pages_fields = {}
+    for fp in field_positions:
+        pages_fields.setdefault(fp["page"], []).append(fp)
+
+    for page_idx, page in enumerate(reader.pages):
+        if page_idx in pages_fields:
+            packet = io.BytesIO()
+            ph = pages_fields[page_idx][0]["page_height"]
+            pw = pages_fields[page_idx][0]["page_width"]
+            c = rl_canvas.Canvas(packet, pagesize=(pw, ph))
+
+            for fp in pages_fields[page_idx]:
+                rl_y = ph - fp["y"] - fp["font_size"] - 2
+                c.setFont("Helvetica", fp["font_size"])
+                c.drawString(fp["x"], rl_y, fp["value"])
+
+            c.save()
+            packet.seek(0)
+            overlay = PdfReader(packet)
+            page.merge_page(overlay.pages[0])
+
+        writer.add_page(page)
+
+    with open(output_path, "wb") as f:
+        writer.write(f)
+
+    filled = len(field_positions)
+    print(f"   📝 PDF overlay: placed {filled} text fields")
     return filled
 
 
