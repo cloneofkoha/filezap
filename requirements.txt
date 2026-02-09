@@ -5,5 +5,7 @@ openpyxl
 python-docx
 pdfplumber
 pypdf
+reportlab
 python-multipart
 httpx
+python-dotenv
