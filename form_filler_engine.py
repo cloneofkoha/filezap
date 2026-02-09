@@ -235,6 +235,7 @@ def fill_xlsx(input_path: str, output_path: str, mappings: list):
 def fill_docx(input_path: str, output_path: str, mappings: list):
     """Fill a Word form by replacing placeholders or blank lines next to labels."""
     import docx
+    from docx.shared import Pt
     doc = docx.Document(input_path)
 
     # Build a lookup: lowercase label → value
@@ -251,20 +252,47 @@ def fill_docx(input_path: str, output_path: str, mappings: list):
     for table in doc.tables:
         for row in table.rows:
             cells = row.cells
-            for i, cell in enumerate(cells):
+            # Build list of unique cells (skip merged duplicates)
+            unique_cells = []
+            seen_tcs = set()
+            for cell in cells:
+                tc_id = id(cell._tc)
+                if tc_id not in seen_tcs:
+                    seen_tcs.add(tc_id)
+                    unique_cells.append(cell)
+
+            for i, cell in enumerate(unique_cells):
                 cell_text = cell.text.strip().lower().rstrip(":")
-                if cell_text in label_map and i + 1 < len(cells):
-                    # The next cell is the answer cell
-                    answer_cell = cells[i + 1]
-                    # Clear and fill
+                # Also try matching without parenthetical notes
+                cell_text_clean = re.sub(r'\s*\(.*?\)\s*', '', cell_text).strip()
+
+                matched_value = None
+                if cell_text in label_map:
+                    matched_value = label_map[cell_text]
+                elif cell_text_clean and cell_text_clean in label_map:
+                    matched_value = label_map[cell_text_clean]
+
+                if matched_value and i + 1 < len(unique_cells):
+                    answer_cell = unique_cells[i + 1]
+                    # Skip if answer cell is not empty (already has content)
+                    if answer_cell.text.strip() and answer_cell.text.strip() != cell.text.strip():
+                        # Cell already has real content, check if it looks like a label
+                        if ':' in answer_cell.text:
+                            continue
+
+                    # Clear the answer cell
                     for paragraph in answer_cell.paragraphs:
                         for run in paragraph.runs:
                             run.text = ""
-                        if paragraph == answer_cell.paragraphs[0]:
-                            if paragraph.runs:
-                                paragraph.runs[0].text = label_map[cell_text]
-                            else:
-                                paragraph.text = label_map[cell_text]
+
+                    # Write the value
+                    first_para = answer_cell.paragraphs[0]
+                    if first_para.runs:
+                        first_para.runs[0].text = matched_value
+                    else:
+                        run = first_para.add_run(matched_value)
+                        run.font.size = Pt(9)
+
                     filled += 1
 
     # Strategy 2: Fill inline "Label: ____" patterns in paragraphs
@@ -288,6 +316,8 @@ def fill_docx(input_path: str, output_path: str, mappings: list):
                     for run in paragraph.runs:
                         run.text = ""
                     paragraph.runs[0].text = new_text
+                else:
+                    paragraph.add_run(new_text)
                 filled += 1
 
     doc.save(output_path)
