@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+anthropic
+openpyxl
+python-docx
+pdfplumber
+pypdf
+python-multipart
+httpx
